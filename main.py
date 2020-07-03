@@ -26,7 +26,7 @@ import time
 import socket
 import json
 import cv2
-
+import numpy as np
 import logging as log
 import paho.mqtt.client as mqtt
 
@@ -44,7 +44,6 @@ MQTT_KEEPALIVE_INTERVAL = 60
 def build_argparser():
     """
     Parse command line arguments.
-
     :return: command line arguments
     """
     parser = ArgumentParser()
@@ -69,17 +68,42 @@ def build_argparser():
 
 
 def connect_mqtt():
-    ### TODO: Connect to the MQTT client ###
-    client = None
-
+    # Connect to the MQTT client ###
+    client = mqtt.Client()
+    client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
     return client
 
+def pre_process(frame, net_input_shape):
+    """
+    Pre-process the image
+    """
+    p_frame = cv2.resize(frame, (net_input_shape[3], net_input_shape[2]))
+    p_frame = p_frame.transpose((2, 0, 1))
+    p_frame = p_frame.reshape(1, *p_frame.shape)
+    return p_frame
+
+def draw_outputs(frame, network_output, prob_threshold, width, height):
+    """
+    Draw bounding boxes onto the frame.
+    :param frame: frame from camera/video
+    :param result: list contains the data comming from inference
+    :return: person count and frame
+    """
+    pointer = 0
+    probs = network_output[0, 0, :, 2]
+    for i, p in enumerate(probs):
+        if p > prob_threshold:
+           pointer += 1
+           box = net_output[0, 0, i, 3:]
+           p1 = (int(box[0] * width), int(box[1] * height))
+           p2 = (int(box[2] * width), int(box[3] * height))
+           frame = cv2.rectangle(frame, p1, p2, (0, 255, 0), 3)
+    return frame, pointer
 
 def infer_on_stream(args, client):
     """
     Initialize the inference network, stream video to network,
     and output stats and video.
-
     :param args: Command line arguments parsed by `build_argparser()`
     :param client: MQTT client
     :return: None
@@ -88,39 +112,116 @@ def infer_on_stream(args, client):
     infer_network = Network()
     # Set Probability threshold for detections
     prob_threshold = args.prob_threshold
+    model = args.model
+    device = args.device
+    cpu_extension = args.cpu_extension
+            
+    # Load the model through `infer_network` ###
+    infer_network.load_model(model, cpu_extension, device)
+    network_dimension = infer_network.get_input_shape()
 
-    ### TODO: Load the model through `infer_network` ###
+    # Handle the input stream ###
+    # Checks live feed
+    if args.input == 'CAM':
+        input_validated = 0
 
-    ### TODO: Handle the input stream ###
+    # Checks input image
+    elif args.input.endswith('.jpg') or args.input.endswith('.bmp') :
+        single_image_mode = True
+        input_validated = args.input
 
-    ### TODO: Loop until stream is over ###
+    # Checks video file
+    else:
+        input_validated = args.input
+        assert os.path.isfile(args.input), "file doesn't exist"
 
-        ### TODO: Read from the video capture ###
+    cap = cv2.VideoCapture(input_validated)
+    cap.open(input_validated)
 
-        ### TODO: Pre-process the image as needed ###
+    width = int(cap.get(3))
+    height = int(cap.get(4))
 
-        ### TODO: Start asynchronous inference for specified request ###
+    input_dimension = network_dimension['image_tensor']
 
-        ### TODO: Wait for the result ###
+    #iniatilize variables
+    
+    duration_prev = 0
+    counter_total = 0
+    dur = 0
+    request_id=0
+    
+    report = 0
+    counter = 0
+    counter_prev = 0
 
-            ### TODO: Get the results of the inference request ###
+    # Loop until stream is over #
+    while cap.isOpened():
+        # Read from the video capture #
+        flag, frame = cap.read()
+        if not flag:
+            break
 
-            ### TODO: Extract any desired stats from the results ###
+        # Pre-process the image as needed #
+        processed_frame = pre_process(frame, input_dimension)
+        
+        # Start asynchronous inference for specified request #
+        network_input = {'image_tensor': processed_frame,'image_info': processed_frame.shape[1:]}
+        duration_report = None
+        infer_network.exec_net(network_input, request_id)
 
-            ### TODO: Calculate and send relevant information on ###
-            ### current_count, total_count and duration to the MQTT server ###
-            ### Topic "person": keys of "count" and "total" ###
-            ### Topic "person/duration": key of "duration" ###
+        # Wait for the result #
+        if infer_network.wait() == 0:
 
-        ### TODO: Send the frame to the FFMPEG server ###
+            # Get the results of the inference request #
+            network_output = infer_network.get_output()
 
-        ### TODO: Write an output image if `single_image_mode` ###
+            # Extract any desired stats from the results #
+            
+            frame, pointer = draw_outputs(frame, network_output, prob_threshold, width, height)
+            if pointer != counter:
+                counter_prev = counter
+                counter = pointer
+                if dur >= 3:
+                    duration_prev = dur
+                    dur = 0
+                else:
+                    dur = duration_prev + dur
+                    duration_prev = 0  # unknown, not needed in this case
+            else:
+                dur += 1
+                if dur >= 3:
+                    report = counter
+                    if dur == 3 and counter > counter_prev:
+                        counter_total += counter - counter_prev
+                    elif dur == 3 and counter < counter_prev:
+                        duration_report = int((duration_prev / 10.0) * 1000)
+
+            # Calculate and send relevant information on #
+            # current_count, total_count and duration to the MQTT server #
+            # Topic "person": keys of "count" and "total" #
+            # Topic "person/duration": key of "duration" #
+            client.publish('person',
+                           payload=json.dumps({
+                               'count': report, 'total': counter_total}),
+                           qos=0, retain=False)
+            if duration_report is not None:
+                client.publish('person/duration',
+                               payload=json.dumps({'duration': duration_report}),
+                               qos=0, retain=False)
+
+        # Send the frame to the FFMPEG server #
+        # Write an output image if `single_image_mode` #
+        frame = cv2.resize(frame, (768, 432))
+        sys.stdout.buffer.write(frame)
+        sys.stdout.flush()
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 def main():
     """
     Load the network and parse the output.
-
     :return: None
     """
     # Grab command line args
